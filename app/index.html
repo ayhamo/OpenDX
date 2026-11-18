@@ -24,6 +24,11 @@ header h1{font-size:16px;margin:0 8px 0 0;font-weight:650;letter-spacing:.2px}
 .btn.danger{border-color:#5a2a2a;color:#ffb4b4}
 .btn.small{padding:4px 9px;font-size:12px}
 .btn[disabled]{opacity:.45;cursor:not-allowed}
+.menu-wrap{position:relative;display:inline-block}
+.menu{position:absolute;right:0;top:calc(100% + 6px);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:4px;min-width:170px;z-index:20;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.menu[hidden]{display:none}
+.menu .btn{text-align:left;white-space:nowrap}
+.menu .btn.active{border-color:var(--accent)}
 #previewWrap{padding:14px 16px 4px}
 #strip{width:100%;height:34px;display:block;border-radius:8px;background:#000}
 .stats{display:flex;gap:14px;color:var(--muted);font-size:12px;padding:6px 16px 0;flex-wrap:wrap}
@@ -66,7 +71,13 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padd
   <span class="pill" id="devInfo" hidden></span>
   <span class="spacer"></span>
   <button class="btn" id="powerBtn" title="Turn the strip off/on">⏻ On</button>
-  <button class="btn primary" id="connectBtn">Connect</button>
+  <div class="menu-wrap">
+    <button class="btn primary" id="connectBtn">Connect</button>
+    <div class="menu" id="connectMenu" hidden>
+      <button class="btn" id="pickSerial" data-conn="serial">USB serial (FE0C)</button>
+      <button class="btn" id="pickHid" data-conn="hid">HID (FE07)</button>
+    </div>
+  </div>
 </header>
 <div class="banner" id="noSerial">This browser has no Web Serial support. Open the app in <b>Microsoft Edge</b> or <b>Google Chrome</b> (use "Start OpenDX.bat").</div>
 
@@ -246,7 +257,7 @@ const DEFAULTS = {
   effect: "rainbowWave", eff1: "#00aaff", eff2: "#ff0066", music: "spectrum", musicSrc: "pc", devMusicIdx: 0, sens: 100, musicColor: "#ff2a6d", musicRainbow: true, musicMirror: true,
   syncStyle: "edges", smooth: 40, satBoost: 25, depth: 12, blackCut: 12,
   L: { left: 16, top: 31, right: 16, bottom: 0, start: "bl", dir: "cw" },
-  brightness: 100, speed: 50, fps: 30, ledCount: 63, order: "RGB", reverse: false, transport: "SC", log: false, power: true,
+  brightness: 100, speed: 50, fps: 30, ledCount: 63, order: "RGB", reverse: false, transport: "SC", connType: "serial", log: false, power: true,
 };
 function loadSettings() {
   let saved = {};
@@ -313,15 +324,39 @@ function toGroups(rgb, n) {
 const ACT = { readInfo: 0x82, setLedEffect: 0x85, setSection: 0x86, brightness: 0x87, speed: 0x8a, soundSens: 0x8b, off: 0x97, computerRhythm: 0x98 };
 const MUSIC_EFFECT_TYPE = 3; // DX Light's effectType for music ("rhythm") effects
 
-// ---------- serial device ----------
+// ---------- device (Web Serial FE0C + WebHID FE07) ----------
 const FILTER = { usbVendorId: 0x1a86, usbProductId: 0xfe0c };
+const HID_FILTER = { vendorId: 0x1a86, productId: 0xfe07, usagePage: 0xff00, usage: 1 };
+const isHidMatch = (d) => d && d.vendorId === HID_FILTER.vendorId && d.productId === HID_FILTER.productId && (!d.collections || d.collections.some((c) => c.usagePage === HID_FILTER.usagePage && (c.usage === undefined || c.usage === HID_FILTER.usage)));
+function trimHidReport(raw) {
+  if (raw[0] === 0x52 && raw[1] === 0x42 && raw[2] >= 6 && raw[2] <= raw.length) return raw.slice(0, raw[2]);
+  let end = raw.length; while (end > 0 && raw[end - 1] === 0) end--;
+  return raw.slice(0, end);
+}
 const dev = {
-  port: null, writer: null, reader: null, rx: [], q: Promise.resolve(), info: null,
-  get connected() { return !!this.writer; },
-  async open(port) {
-    await port.open({ baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none", bufferSize: 4096 });
-    try { await port.setSignals({ dataTerminalReady: true }); } catch {}
-    this.port = port; this.writer = port.writable.getWriter(); this.readLoop();
+  port: null, hid: null, kind: null, writer: null, reader: null, rx: [], q: Promise.resolve(), info: null,
+  get connected() { return !!(this.writer || (this.hid && this.hid.opened !== false)); },
+  pushRx(bytes) {
+    if (!bytes.length) return;
+    for (const b of bytes) this.rx.push(b);
+    if (this.rx.length > 4096) this.rx.splice(0, this.rx.length - 4096);
+    log("RX " + hexStr(bytes));
+  },
+  async open(target, kind = "sendReport" in target ? "hid" : "serial") {
+    await this.close();
+    if (kind === "hid") {
+      if (!isHidMatch(target)) throw new Error("Unsupported HID collection");
+      if (!target.opened) await target.open();
+      this.hid = target; this.kind = "hid";
+      target.oninputreport = (e) => {
+        const d = e.data, raw = d instanceof Uint8Array ? d : new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+        this.pushRx(trimHidReport(raw));
+      };
+      return;
+    }
+    await target.open({ baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none", bufferSize: 4096 });
+    try { await target.setSignals({ dataTerminalReady: true }); } catch {}
+    this.port = target; this.kind = "serial"; this.writer = target.writable.getWriter(); this.readLoop();
   },
   async readLoop() {
     const reader = this.port.readable.getReader(); this.reader = reader;
@@ -329,40 +364,59 @@ const dev = {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        for (const b of value) this.rx.push(b);
-        if (this.rx.length > 4096) this.rx.splice(0, this.rx.length - 4096);
-        log("RX " + hexStr(value));
+        this.pushRx(value);
       }
     } catch {} finally { try { reader.releaseLock(); } catch {} }
   },
   send(bytes) {
-    if (!this.writer) return Promise.resolve();
+    if (!this.connected) return Promise.resolve();
     if (bytes.length <= 64) log("TX " + hexStr(bytes)); else log(`TX ${hexStr(bytes.slice(0, 24))} … (${bytes.length} bytes)`);
+    if (this.kind === "hid") {
+      this.q = this.q.then(async () => {
+        for (let off = 0; off < bytes.length; off += 64) {
+          if (!this.hid) return;
+          const r = new Uint8Array(64); r.set(bytes.subarray(off, off + 64));
+          await this.hid.sendReport(0, r);
+          if (off + 64 < bytes.length) await sleep(1);
+        }
+      }).catch((e) => { log("write error " + e); });
+      return this.q;
+    }
     this.q = this.q.then(() => this.writer && this.writer.write(bytes)).catch((e) => { log("write error " + e); });
     return this.q;
   },
   async readInfo() {
     this.rx = [];
-    await this.send(rbFrame(ACT.readInfo));
+    const req = rbFrame(ACT.readInfo), reqSeq = req[3];
+    await this.send(req);
     await sleep(300);
     const r = this.rx.slice();
-    if (r.length >= 24 && r[0] === 0x52 && r[1] === 0x42 && r[4] === 0x82) {
-      return { id: hexStr(r.slice(5, 8)).replace(/ /g, ""), display: r[8], leds: r[11], fw: `${r[21]}.${r[22]}.${r[23]}`, fwNum: r[21] * 10000 + r[22] * 100 + r[23] };
+    let m = null;
+    for (let i = 0; i + 24 <= r.length; i++) {
+      if (r[i] === 0x52 && r[i + 1] === 0x42 && r[i + 4] === 0x82) {
+        m = r.slice(i, i + 24);
+        if (r[i + 3] === reqSeq) break;
+      }
+    }
+    if (m) {
+      return { id: hexStr(m.slice(5, 8)).replace(/ /g, ""), display: m[8], leds: m[11], fw: `${m[21]}.${m[22]}.${m[23]}`, fwNum: m[21] * 10000 + m[22] * 100 + m[23] };
     }
     return null;
   },
   async close() {
-    const p = this.port;
+    const p = this.port, h = this.hid;
+    this.port = this.hid = this.kind = this.info = null;
     this.writer && this.writer.releaseLock(); this.writer = null;
     try { await this.reader?.cancel(); } catch {}
+    this.reader = null;
     try { await p?.close(); } catch {}
-    this.port = null;
+    if (h) { h.oninputreport = null; try { await h.close(); } catch {} }
   },
 };
 
-async function connect(port) {
+async function connect(target, kind = "sendReport" in target ? "hid" : "serial") {
   try {
-    await dev.open(port);
+    await dev.open(target, kind);
   } catch (e) {
     setConn(false, String(e.message || e).includes("open") ? "Port busy. Is DX Light still running?" : "Could not open: " + e.message);
     return;
@@ -378,7 +432,7 @@ async function connect(port) {
     $("#devInfo").textContent = `${info.leds} LEDs · fw ${info.fw}`;
     syncInputs(); save();
   }
-  setConn(true, "Connected (COM)");
+  setConn(true, dev.kind === "hid" ? "Connected (HID)" : "Connected (COM)");
   lastKey = "";
 }
 function setConn(on, text) {
@@ -386,6 +440,7 @@ function setConn(on, text) {
   $("#connText").textContent = text;
   $("#connectBtn").textContent = on ? "Disconnect" : "Connect";
   if (!on) $("#devInfo").hidden = true;
+  updateMusicUi();
 }
 
 // ---------- effects ----------
@@ -461,7 +516,14 @@ const MUSIC = {
 const MUSIC_HINTS = {
   pc: "The app captures what your PC is playing, builds the light show here and sends it over USB. In the dialog pick <b>Entire screen</b> and turn on <b>Share system audio</b>.",
   device: "The controller runs its own music effects using the small microphone on the controller. Nothing is sent from the PC except the effect choice.",
-  pcdevice: "Sends the PC's loudness to the controller so its own music effects follow PC audio instead of its microphone. DX Light only does this for newer controllers (firmware 1.8.2+); yours reports 1.1.2, so it may be ignored. Tell me if the lights react.",
+  get pcdevice() {
+    const fw = dev.info?.fw, isHid = (dev.kind || S.connType) === "hid";
+    const model = isHid ? "HID (1A86:FE07)" : "USB serial (1A86:FE0C)";
+    const tail = fw
+      ? `yours (${model}) reports firmware ${fw}, so ${isHid && dev.info.fwNum >= 10802 ? "DX Light enables it on your controller" : "it may be ignored"}.`
+      : "connect a controller to see its reported firmware.";
+    return `Sends the PC's loudness to the controller so its own music effects follow PC audio instead of its microphone. DX Light only enables computer-audio rhythm for the HID model (1A86:FE07) on firmware 1.8.2+ (1.8.2 and newer); ${tail} Tell me if the lights react.`;
+  },
   mic: "Uses a microphone on the PC (not the controller's) and builds the light show in this app.",
 };
 function updateMusicUi() {
@@ -811,6 +873,7 @@ $$("[data-k]").forEach((el) => {
     if (k === "color") setMode("static");
     if (k.startsWith("grad")) setMode("gradient");
     if (k === "eff1" || k === "eff2") setMode("effects");
+    if (k === "transport") lastKey = "";
     if (k === "log" && !v) $("#log").textContent = "";
     save();
   });
@@ -877,29 +940,66 @@ $("#hwResume").onclick = () => { setMode(S.prevMode || "effects"); };
 $("#readInfo").onclick = async () => {
   if (!dev.connected) return log("not connected");
   paused = true; const info = await dev.readInfo(); paused = false;
+  if (info) { dev.info = info; updateMusicUi(); }
   log("device info: " + JSON.stringify(info));
   if (!S.log) alert(info ? JSON.stringify(info, null, 1) : "No reply");
 };
 
 // connection
+const hasSerial = "serial" in navigator, hasHid = "hid" in navigator;
+function syncConnMenu() {
+  $("#pickSerial").disabled = !hasSerial;
+  $("#pickHid").disabled = !hasHid;
+  $("#pickSerial").classList.toggle("active", S.connType === "serial");
+  $("#pickHid").classList.toggle("active", S.connType === "hid");
+}
 $("#connectBtn").onclick = async () => {
-  if (!("serial" in navigator)) return;
-  if (dev.connected) { await dev.close(); setConn(false, "Not connected"); return; }
-  try { const port = await navigator.serial.requestPort({ filters: [FILTER] }); await connect(port); }
-  catch (e) { if (e.name !== "NotFoundError") setConn(false, e.message); }
+  if (!hasSerial && !hasHid) return;
+  if (dev.connected) { $("#connectMenu").hidden = true; await dev.close(); setConn(false, "Not connected"); return; }
+  syncConnMenu();
+  $("#connectMenu").hidden = !$("#connectMenu").hidden;
 };
-if ("serial" in navigator) {
-  navigator.serial.addEventListener("disconnect", (e) => { if (e.target === dev.port || e.port === dev.port) { dev.close(); setConn(false, "Unplugged"); } });
-  navigator.serial.addEventListener("connect", async () => { if (!dev.connected) autoConnect(); });
-  async function autoConnect() {
-    const ports = await navigator.serial.getPorts();
-    const p = ports.find((x) => { const i = x.getInfo(); return i.usbVendorId === FILTER.usbVendorId && i.usbProductId === FILTER.usbProductId; });
-    if (p) await connect(p);
+async function pickConn(kind) {
+  $("#connectMenu").hidden = true;
+  if (kind === "hid" ? !hasHid : !hasSerial) return;
+  S.connType = kind; save();
+  try {
+    const target = kind === "hid" ? (await navigator.hid.requestDevice({ filters: [HID_FILTER] }))[0] : await navigator.serial.requestPort({ filters: [FILTER] });
+    if (target) await connect(target, kind);
+  } catch (e) { if (e.name !== "NotFoundError") setConn(false, e.message); }
+}
+$("#pickSerial").onclick = () => pickConn("serial");
+$("#pickHid").onclick = () => pickConn("hid");
+document.addEventListener("click", (e) => { if (!e.target?.closest?.(".menu-wrap")) $("#connectMenu").hidden = true; });
+async function autoConnect() {
+  if (dev.connected) return;
+  const order = S.connType === "hid" ? ["hid", "serial"] : ["serial", "hid"];
+  for (const k of order) {
+    if (k === "serial" && hasSerial) {
+      const ports = await navigator.serial.getPorts();
+      const p = ports.find((x) => { const i = x.getInfo(); return i.usbVendorId === FILTER.usbVendorId && i.usbProductId === FILTER.usbProductId; });
+      if (p) { await connect(p, "serial"); return; }
+    }
+    if (k === "hid" && hasHid) {
+      const devs = await navigator.hid.getDevices();
+      const d = devs.find(isHidMatch);
+      if (d) { await connect(d, "hid"); return; }
+    }
   }
-  autoConnect();
-} else {
+}
+if (!hasSerial && !hasHid) {
   $("#noSerial").style.display = "block";
   $("#connectBtn").disabled = true;
+} else {
+  if (hasSerial) {
+    navigator.serial.addEventListener("disconnect", (e) => { if (dev.port && (e.target === dev.port || e.port === dev.port)) { dev.close(); setConn(false, "Unplugged"); } });
+    navigator.serial.addEventListener("connect", () => { if (!dev.connected) autoConnect(); });
+  }
+  if (hasHid) {
+    navigator.hid.addEventListener("disconnect", (e) => { if (dev.hid && (e.device === dev.hid || e.target === dev.hid)) { dev.close(); setConn(false, "Unplugged"); } });
+    navigator.hid.addEventListener("connect", (e) => { if (!dev.connected) { if (isHidMatch(e?.device)) connect(e.device, "hid"); else autoConnect(); } });
+  }
+  autoConnect();
 }
 window.addEventListener("beforeunload", () => { dev.close(); });
 
